@@ -1,11 +1,12 @@
+import re
 from collections.abc import Callable
 
 import pandas as pd
 import torch
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from torch.utils.data import Dataset
+from transformers import PreTrainedTokenizerBase
 
 
 class SFTDataset(Dataset):
@@ -29,11 +30,15 @@ class SFTDataset(Dataset):
         return self.prompts[idx], self.responses[idx]
 
 
-def make_collate_fn(tokenizer: PreTrainedTokenizerBase) -> Callable[[list[tuple[str, str]]], dict[str, Tensor]]:
-    def collate_fn(batch: list[tuple[str, str]]) -> dict[str, Tensor]:
+def make_collate_fn(
+    tokenizer: PreTrainedTokenizerBase,
+) -> Callable[[list[tuple[str, str]]], dict[str, Tensor | list[str]]]:
+    def collate_fn(batch: list[tuple[str, str]]) -> dict[str, Tensor | list[str]]:
         prompts, responses = zip(*batch)
         prompts, responses = list(prompts), list(responses)
-        return tokenize_prompt_and_output(prompts, responses, tokenizer)
+        dct: dict[str, Tensor | list[str]] = tokenize_prompt_and_output(prompts, responses, tokenizer)  # type: ignore
+        dct.update({"prompts": prompts, "responses": responses})
+        return dct
 
     return collate_fn
 
@@ -79,21 +84,26 @@ def tokenize_prompt_and_output(
     }
 
 
-if __name__ == "__main__":
-    model_id = "Qwen/Qwen2.5-Math-1.5B"
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    collate_fn = make_collate_fn(tokenizer)
-    train_dataset = SFTDataset(tokenizer, "data/gsm8k/train.jsonl")
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=8,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=collate_fn,
-    )
-    batch = next(iter(train_loader))
-    for k, v in batch.items():
-        print(k, v.shape, v.dtype)
-        break
+def parse_gsm8k_response(response) -> str | None:
+    # https://github.com/QwenLM/Qwen/blob/main/eval/evaluate_gsm8k.py
+    try:
+        return re.findall(r"\d+", response)[-1]
+    except:
+        return None
+
+
+def extract_answer_hf_gsm8k(completion):
+    ANS_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
+    match = ANS_RE.search(completion)
+    if match:
+        match_str = match.group(1).strip()
+        match_str = match_str.replace(",", "")
+        return match_str
+    else:
+        return None
+
+
+def gsm8k_reward_fn(completion: str, answer: str) -> int:
+    gold = extract_answer_hf_gsm8k(answer)
+    assert gold is not None, "No ground truth answer found in the document."
+    return extract_answer_hf_gsm8k(completion) == gold

@@ -6,6 +6,10 @@ from datasets import load_dataset
 from drgrpo_grader import r1_zero_reward_fn
 from vllm import LLM, SamplingParams
 
+"""
+Section 3.2 : Zero-shot MATH Baseline
+"""
+
 TEMPLATE_PATH = "cs336_alignment/prompts/r1_zero.prompt"
 
 

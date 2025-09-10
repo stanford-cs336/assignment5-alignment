@@ -9,7 +9,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
-from cs336_alignment.sft_dataset import tokenize_prompt_and_output
+from cs336_alignment.sft_dataset import parse_gsm8k_response, tokenize_prompt_and_output
 from cs336_alignment.sft_trainer import sft_microbatch_train_step
 from cs336_alignment.utils import compute_entropy, get_reponse_log_probs, masked_normalize
 
@@ -388,7 +388,7 @@ def run_parse_gsm8k_response(
         str with the predicted numeric answer if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    return parse_gsm8k_response(model_output)
 
 
 def run_compute_per_instance_dpo_loss(
