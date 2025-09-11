@@ -103,7 +103,8 @@ def extract_answer_hf_gsm8k(completion):
         return None
 
 
-def gsm8k_reward_fn(completion: str, answer: str) -> int:
+def gsm8k_reward_fn(completion: str, answer: str) -> dict[str, float]:
     gold = extract_answer_hf_gsm8k(answer)
     assert gold is not None, "No ground truth answer found in the document."
-    return extract_answer_hf_gsm8k(completion) == gold
+    answer_reward = extract_answer_hf_gsm8k(completion) == gold
+    return {"reward": answer_reward}

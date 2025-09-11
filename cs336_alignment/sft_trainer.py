@@ -1,19 +1,19 @@
 import json
 import logging
 import os
-from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn.utils as nn_utils
-import wandb
 from jaxtyping import Float
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from utils import vllm_generation_per_batch
 from vllm import SamplingParams
 
+import wandb
 from cs336_alignment.sft_dataset import SFTDataset, gsm8k_reward_fn, make_collate_fn
 from cs336_alignment.utils import (
     get_reponse_log_probs,
@@ -45,9 +45,9 @@ class TrainConfig:
     vllm_seed: int = 42
 
     # Data
-    batch_size: int = 8
+    batch_size: int = 16
 
-    # Training loop
+    # Train/Eval
     eval_interval: int = 100
 
     # Logging
@@ -109,7 +109,7 @@ class SFTTrainer:
             collate_fn=collate_fn,
         )
 
-    def train(self):
+    def train(self, verbose=True):
         config = self.config
         self.model.train()
         self.optimizer.zero_grad()
@@ -119,11 +119,12 @@ class SFTTrainer:
             response_mask = inputs["response_mask"].to(config.device)
             out = get_reponse_log_probs(self.model, input_ids, labels, return_token_entropy=False)
             policy_log_probs = out["log_probs"]
+            normalize_constant = response_mask.sum(dim=1).clamp_min(1.0)  # normalize per example
             loss, _ = sft_microbatch_train_step(
                 policy_log_probs=policy_log_probs,
                 response_mask=response_mask,
                 gradient_accumulation_steps=config.gradient_accumulation_steps,
-                normalize_constant=1.0,
+                normalize_constant=normalize_constant,
             )
 
             if (i + 1) % config.log_interval == 0:  # light logging
@@ -139,42 +140,34 @@ class SFTTrainer:
             if (i + 1) % config.eval_interval == 0:
                 logger.info(f"Evaluating policy at step {i + 1}")
                 load_policy_into_vllm_instance(self.model, self.vllm_model)
-                self.evaluate_policy(i + 1)
+                self.evaluate_policy(i + 1, verbose=verbose)
 
-    def _evaluate_vllm(
-        self, reward_fn: Callable[[str, str], int], prompts: list[str], ground_truths: list[str]
-    ) -> tuple[list[dict[str, str | int]], int]:
-        results = []
-        num_correct = 0
-        outputs = self.vllm_model.generate(prompts, self.sampling_params)
-        for output, ground_truth in zip(outputs, ground_truths):
-            reward = reward_fn(output.outputs[0].text, ground_truth)
-            num_correct += 1 if reward == 1 else 0
-            result = {
-                "response": output.outputs[0].text,
-                "ground_truth": ground_truth,
-                "reward": reward,
-            }
-            results.append(result)
-        return results, num_correct
-
-    @torch.no_grad()
-    def evaluate_policy(self, step: int) -> None:
-        # TODO: evaluate vllm
+    def evaluate_policy(self, step: int, verbose=True) -> None:
         self.model.eval()
         results = []
         num_correct = 0
+        avg_response_len = 0
+        avg_response_len_correct = 0
         for inputs in self.val_loader:
             prompts = inputs["prompts"]
             answers = inputs["responses"]
-            batch_results, batch_correct = self._evaluate_vllm(gsm8k_reward_fn, prompts, answers)
+            batch_results, batch_correct, batch_response_len, batch_response_len_correct = vllm_generation_per_batch(
+                self.vllm_model, gsm8k_reward_fn, prompts, answers, self.sampling_params, verbose=verbose
+            )
             num_correct += batch_correct
+            avg_response_len += batch_response_len
+            avg_response_len_correct += batch_response_len_correct
             results.extend(batch_results)
 
+        avg_response_len /= len(self.val_dataset)
+        avg_response_len_correct /= num_correct if num_correct > 0 else 1
         val_acc = num_correct / len(self.val_dataset)
+
         logger.info(f"Validation accuracy: {val_acc:.4f}")
         if self.config.use_wandb:
             wandb.log({"eval/accuracy": val_acc, "eval_step": step})
+            wandb.log({"eval/avg_response_len": avg_response_len, "eval_step": step})
+            wandb.log({"eval/avg_response_len_correct": avg_response_len_correct, "eval_step": step})
 
         os.makedirs("cs336_alignment/results", exist_ok=True)
         json.dump(results, open(f"cs336_alignment/results/sft_gsm8k_step_{step}.json", "w"), indent=4)
@@ -210,4 +203,4 @@ if __name__ == "__main__":
     train_ds = SFTDataset(config, tokenizer, "data/gsm8k/train.jsonl")
     val_ds = SFTDataset(config, tokenizer, "data/gsm8k/test.jsonl")
     trainer = SFTTrainer(config, tokenizer, model, train_ds, val_ds)
-    trainer.train()
+    trainer.train(verbose=False)
