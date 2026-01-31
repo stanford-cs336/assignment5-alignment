@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="Black">
+    <option name="sdkName" value="$USER_HOME$/miniforge3/envs/py311" />
+  </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="Remote Python 3.12.3 (sftp://root@198.13.252.107:42031/workspace/cs336_mirror/assignment5-alignment/.venv/bin/python)" project-jdk-type="Python SDK" />
+</project>

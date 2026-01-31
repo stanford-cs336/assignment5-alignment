@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="root@198.13.252.107:42031 key" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+    <option name="confirmBeforeUploading" value="false" />
+    <serverData>
+      <paths name="root@198.13.252.107:42031 key">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/workspace/cs336_mirror/assignment5-alignment" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@198.13.252.23:15528 key">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/workspace/cs336_mirror/assignment5-alignment" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@198.13.252.35:26068 key">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/tmp/pycharm_project_497" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@198.13.252.35:26068 key (2)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/workspace/cs336_mirror/assignment5-alignment" local="$PROJECT_DIR$" />
+          </mappings>
+          <excludedPaths>
+            <excludedPath local="true" path=".venv/" />
+            <excludedPath local="true" path="**/site-packages/**" />
+            <excludedPath local="true" path="**/__pycache__/**" />
+          </excludedPaths>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>
