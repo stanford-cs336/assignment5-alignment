@@ -134,13 +134,30 @@ def run_async_evaluation(vllm_instance, reward_fn, prompts, ground_truths, sampl
 
 
 
-def train(model, vllm_instance, train_prompts, train_answers):
-    # Initialize wandb with custom metrics
-    wandb.init(project="math-sft")
-    wandb.define_metric("train_step")
-    wandb.define_metric("eval_step")
-    wandb.define_metric("train/*", step_metric="train_step")
-    wandb.define_metric("eval/*", step_metric="eval_step")
+def train(model, vllm_instance, train_prompts, train_answers,
+          optimizer=None, checkpoint_prefix="epoch", epoch_count=1,
+          init_wandb=True, run_eval=True):
+    """
+    Train model on provided prompts and answers.
+
+    Args:
+        model: The model to train
+        vllm_instance: vLLM instance for evaluation
+        train_prompts: List of formatted prompts
+        train_answers: List of formatted answers
+        optimizer: Optional optimizer (creates new one if None)
+        checkpoint_prefix: Prefix for checkpoint naming (e.g., "epoch" -> "epoch_1")
+        epoch_count: Number of epochs to train
+        init_wandb: Whether to initialize wandb (set False if already initialized)
+        run_eval: Whether to run evaluation during training
+    """
+    # Initialize wandb with custom metrics (only if requested)
+    if init_wandb:
+        wandb.init(project="math-sft")
+        wandb.define_metric("train_step")
+        wandb.define_metric("eval_step")
+        wandb.define_metric("train/*", step_metric="train_step")
+        wandb.define_metric("eval/*", step_metric="eval_step")
 
     gradient_accumulation_steps = 16
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-1.5B-Instruct")
@@ -159,14 +176,15 @@ def train(model, vllm_instance, train_prompts, train_answers):
     labels = tokenized['labels']
     response_mask = tokenized['response_mask']
     epoch_size = input_ids.shape[0]
-    epoch_count = 3
 
     if torch.cuda.is_available():
         input_ids = input_ids.to("cuda:0")
         labels = labels.to("cuda:0")
         response_mask = response_mask.to("cuda:0")
 
-    optimizer = AdamW(model.parameters(), lr=1e-5)
+    # Use provided optimizer or create new one
+    if optimizer is None:
+        optimizer = AdamW(model.parameters(), lr=1e-5)
     optimizer.zero_grad()
 
     print(f"Starting training for {epoch_count} epochs")
@@ -228,8 +246,8 @@ def train(model, vllm_instance, train_prompts, train_answers):
                     print(f"  Step {global_step} | Loss: {loss.item():.4f} | Avg Loss (last 10): {avg_loss:.4f}")
                     wandb.log({"train/loss": loss.item(), "train_step": global_step})
 
-                # Evaluate every N optimizer steps (async)
-                if global_step % evaluation_step == 0:
+                # Evaluate every N optimizer steps (async) - only if run_eval is True
+                if run_eval and global_step % evaluation_step == 0:
                     # Wait for previous evaluation to finish before starting new one
                     if eval_thread is not None and eval_thread.is_alive():
                         eval_thread.join()
@@ -250,9 +268,10 @@ def train(model, vllm_instance, train_prompts, train_answers):
         # Save checkpoint after each epoch
         checkpoint_dir = Path("checkpoints")
         checkpoint_dir.mkdir(exist_ok=True)
-        model.save_pretrained(checkpoint_dir / f"epoch_{epoch + 1}")
-        tokenizer.save_pretrained(checkpoint_dir / f"epoch_{epoch + 1}")
-        print(f"Saved checkpoint to {checkpoint_dir / f'epoch_{epoch + 1}'}")
+        checkpoint_name = f"{checkpoint_prefix}_{epoch + 1}"
+        model.save_pretrained(checkpoint_dir / checkpoint_name)
+        tokenizer.save_pretrained(checkpoint_dir / checkpoint_name)
+        print(f"Saved checkpoint to {checkpoint_dir / checkpoint_name}")
 
     # Wait for any remaining evaluation to complete
     if eval_thread is not None and eval_thread.is_alive():
@@ -260,7 +279,7 @@ def train(model, vllm_instance, train_prompts, train_answers):
         eval_thread.join()
 
     print("\nTraining complete!")
-    return model, tokenizer
+    return model, tokenizer, optimizer
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
     """
@@ -315,4 +334,4 @@ if __name__ == "__main__":
     model_to_train = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-Math-1.5B-Instruct")
     vllm_instance = init_vllm("Qwen/Qwen2.5-Math-1.5B-Instruct", device="cuda:1", seed=42)  # GPU 1 for evaluation
 
-    train(model_to_train, vllm_instance, formatted_prompts, formatted_answers)
+    train(model_to_train, vllm_instance, formatted_prompts, formatted_answers, epoch_count=3)
