@@ -21,6 +21,12 @@ from cs336_alignment.impl.mathBaseline import evaluate_vllm
 from cs336_alignment.impl.util import tokenize_prompt_and_output, get_response_log_probs, \
     sft_microbatch_train_step
 
+# Check for single GPU mode
+SINGLE_GPU = os.environ.get("SINGLE_GPU", "0") == "1"
+TRAIN_DEVICE = "cuda:0"
+VLLM_DEVICE = "cuda:0" if SINGLE_GPU else "cuda:1"
+VLLM_GPU_MEMORY = 0.45 if SINGLE_GPU else 0.85
+
 ds = load_dataset("gsm8k", "main")
 
 def load_r1_zero_prompt_template() -> str:
@@ -163,7 +169,7 @@ def train(model, vllm_instance, train_prompts, train_answers,
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-1.5B-Instruct")
     model.train()  # Set to training mode
     if torch.cuda.is_available():
-        model = model.to("cuda:0")  # Explicitly use GPU 0 for training
+        model = model.to(TRAIN_DEVICE)
 
     # Set padding token
     if tokenizer.pad_token is None:
@@ -178,9 +184,9 @@ def train(model, vllm_instance, train_prompts, train_answers,
     epoch_size = input_ids.shape[0]
 
     if torch.cuda.is_available():
-        input_ids = input_ids.to("cuda:0")
-        labels = labels.to("cuda:0")
-        response_mask = response_mask.to("cuda:0")
+        input_ids = input_ids.to(TRAIN_DEVICE)
+        labels = labels.to(TRAIN_DEVICE)
+        response_mask = response_mask.to(TRAIN_DEVICE)
 
     # Use provided optimizer or create new one
     if optimizer is None:
@@ -332,6 +338,6 @@ if __name__ == "__main__":
     formatted_prompts = [prompt_template.format(question=q) for q in raw_questions]
     formatted_answers = [format_gsm8k_answer_for_r1_zero(a) for a in raw_answers]
     model_to_train = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-Math-1.5B-Instruct")
-    vllm_instance = init_vllm("Qwen/Qwen2.5-Math-1.5B-Instruct", device="cuda:1", seed=42)  # GPU 1 for evaluation
+    vllm_instance = init_vllm("Qwen/Qwen2.5-Math-1.5B-Instruct", device=VLLM_DEVICE, seed=42, gpu_memory_utilization=VLLM_GPU_MEMORY)
 
     train(model_to_train, vllm_instance, formatted_prompts, formatted_answers, epoch_count=3)

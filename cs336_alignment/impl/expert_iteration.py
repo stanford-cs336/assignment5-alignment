@@ -1,3 +1,5 @@
+import os
+import gc
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.optim import AdamW
@@ -7,9 +9,14 @@ from vllm import SamplingParams
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from pathlib import Path
 
-import threading
 from cs336_alignment.impl.sft_train import init_vllm, load_r1_zero_prompt_template, \
     train, load_policy_into_vllm_instance, run_async_evaluation, sampling_params as eval_sampling_params
+
+# Check for single GPU mode
+SINGLE_GPU = os.environ.get("SINGLE_GPU", "0") == "1"
+TRAIN_DEVICE = "cuda:0"
+VLLM_DEVICE = "cuda:0" if SINGLE_GPU else "cuda:1"
+VLLM_GPU_MEMORY = 0.85  # Full memory since we run sequentially in single GPU mode
 
 n_ei_steps = 5
 batch_size = 256
@@ -25,11 +32,25 @@ sampling_params = SamplingParams(
 )
 
 
+def free_vllm(vllm_instance):
+    """Free vLLM instance and clear GPU memory."""
+    del vllm_instance
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("Freed vLLM memory")
+
+
+def free_model(model):
+    """Free training model and clear GPU memory."""
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("Freed training model memory")
+
+
 def expert_iteration():
     checkpoint_path = Path("checkpoints/epoch_2")
-    model = AutoModelForCausalLM.from_pretrained(checkpoint_path).to("cuda:0")
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-1.5B-Instruct")
-    vllm_instance = init_vllm("checkpoints/epoch_2", seed=42, device="cuda:1")
 
     # Set padding token
     if tokenizer.pad_token is None:
@@ -39,9 +60,6 @@ def expert_iteration():
     wandb.init(project="expert-iteration")
     wandb.define_metric("ei_step")
     wandb.define_metric("ei/*", step_metric="ei_step")
-
-    # Create optimizer once to maintain momentum across EI steps
-    optimizer = AdamW(model.parameters(), lr=1e-5)
 
     # Load prompt template
     prompt_template = load_r1_zero_prompt_template()
@@ -59,16 +77,25 @@ def expert_iteration():
     # Validation data for evaluation
     prompts_valid = [example['question'] for example in ds['test']]
     ground_truths_valid = [example['answer'] for example in ds['test']]
-    eval_thread = None  # Track running evaluation thread
+
+    # Track optimizer state on CPU to persist across model reloads
+    optimizer_state = None
+    current_checkpoint = str(checkpoint_path)
 
     for ei_step in range(n_ei_steps):
         print(f"\n{'='*60}")
         print(f"Starting EI step {ei_step}")
         print(f"{'='*60}")
 
+        # === PHASE 1: Generation with vLLM ===
+        print(f"\n[EI Step {ei_step}] Loading vLLM for generation...")
+        vllm_instance = init_vllm(current_checkpoint, seed=42, device=VLLM_DEVICE, gpu_memory_utilization=VLLM_GPU_MEMORY)
+
         current_batch_prompts = formatted_prompts[ei_step*batch_size:(ei_step+1)*batch_size]
         current_batch_raw_answers = raw_answers[ei_step*batch_size:(ei_step+1)*batch_size]
         current_batch_questions = raw_questions[ei_step*batch_size:(ei_step+1)*batch_size]
+
+        print(f"Generating {len(current_batch_prompts)} x {rollout_count} = {len(current_batch_prompts) * rollout_count} rollouts...")
         current_batch_generations = vllm_instance.generate(current_batch_prompts, sampling_params)
 
         # Log first 2 prompts and answers
@@ -77,6 +104,7 @@ def expert_iteration():
             print(f"Question: {current_batch_questions[log_idx][:200]}...")
             print(f"Ground truth answer: {current_batch_raw_answers[log_idx][:200]}...")
 
+        # Filter successful generations
         current_batch_sft_prompts = []
         current_batch_sft_answers = []
         for i in range(len(current_batch_prompts)):
@@ -94,38 +122,66 @@ def expert_iteration():
                     current_batch_sft_answers.append(current_generated_text)
 
         print(f"\n{'='*60}\n")
-
         print(f"EI step {ei_step}: {len(current_batch_sft_prompts)} successful generations out of {len(current_batch_prompts) * rollout_count} total")
         wandb.log({"ei/successful_generations": len(current_batch_sft_prompts), "ei_step": ei_step})
 
+        # Free vLLM before training (in single GPU mode)
+        if SINGLE_GPU:
+            free_vllm(vllm_instance)
+            vllm_instance = None
+
+        # === PHASE 2: Training ===
         if len(current_batch_sft_prompts) > 0:
+            print(f"\n[EI Step {ei_step}] Loading model for training...")
+            model = AutoModelForCausalLM.from_pretrained(current_checkpoint).to(TRAIN_DEVICE)
+
+            # Restore optimizer state if we have one
+            optimizer = AdamW(model.parameters(), lr=1e-5)
+            if optimizer_state is not None:
+                optimizer.load_state_dict(optimizer_state)
+
+            # Train (pass None for vllm_instance since we're not doing eval during training)
             model, _, optimizer = train(
-                model, vllm_instance, current_batch_sft_prompts, current_batch_sft_answers,
+                model, None, current_batch_sft_prompts, current_batch_sft_answers,
                 optimizer=optimizer,
                 checkpoint_prefix=f"ei_step_{ei_step}",
                 epoch_count=1,
                 init_wandb=False,
                 run_eval=False
             )
+
+            # Save checkpoint for next iteration
+            next_checkpoint = f"checkpoints/ei_step_{ei_step}_1"
+            current_checkpoint = next_checkpoint
+
+            # Save optimizer state to CPU
+            optimizer_state = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                             for k, v in optimizer.state_dict().items()}
+
+            # Free training model before evaluation (in single GPU mode)
+            if SINGLE_GPU:
+                free_model(model)
+                model = None
         else:
             print(f"EI step {ei_step}: No successful generations, skipping training")
 
-        # Run async evaluation after each EI step
-        if eval_thread is not None and eval_thread.is_alive():
-            eval_thread.join()
-        load_policy_into_vllm_instance(model, vllm_instance)
-        eval_thread = threading.Thread(
-            target=run_async_evaluation,
-            args=(vllm_instance, r1_zero_reward_fn, prompts_valid, ground_truths_valid, eval_sampling_params, ei_step)
-        )
-        eval_thread.start()
+        # === PHASE 3: Evaluation ===
+        print(f"\n[EI Step {ei_step}] Loading vLLM for evaluation...")
+        vllm_instance = init_vllm(current_checkpoint, seed=42, device=VLLM_DEVICE, gpu_memory_utilization=VLLM_GPU_MEMORY)
 
-    # Wait for final evaluation to complete
-    if eval_thread is not None and eval_thread.is_alive():
-        print("Waiting for final evaluation to complete...")
-        eval_thread.join()
+        # Run evaluation synchronously in single GPU mode, async otherwise
+        if SINGLE_GPU:
+            run_async_evaluation(vllm_instance, r1_zero_reward_fn, prompts_valid, ground_truths_valid, eval_sampling_params, ei_step)
+            free_vllm(vllm_instance)
+            vllm_instance = None
+        else:
+            # In dual GPU mode, keep vLLM loaded for next iteration
+            load_policy_into_vllm_instance(model, vllm_instance)
+            run_async_evaluation(vllm_instance, r1_zero_reward_fn, prompts_valid, ground_truths_valid, eval_sampling_params, ei_step)
 
-    # Save final model after all EI steps
+    # Save final model
+    print(f"\n[Final] Loading model to save final checkpoint...")
+    model = AutoModelForCausalLM.from_pretrained(current_checkpoint)
     checkpoint_dir = Path("checkpoints")
     checkpoint_dir.mkdir(exist_ok=True)
     model.save_pretrained(checkpoint_dir / "ei_final")
@@ -138,5 +194,3 @@ def expert_iteration():
 
 if __name__ == "__main__":
     expert_iteration()
-
-
