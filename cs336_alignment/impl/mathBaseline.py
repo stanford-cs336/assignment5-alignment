@@ -1,6 +1,6 @@
 import os
-os.environ['VLLM_ATTENTION_BACKEND'] = 'FLASHINFER'
-os.environ['VLLM_USE_TRITON_FLASH_ATTN'] = '0'
+# Use Flash Attention instead of FlashInfer (FlashInfer not available on all platforms)
+os.environ['VLLM_ATTENTION_BACKEND'] = 'FLASH_ATTN'
 
 from datasets import load_dataset
 from vllm import LLM, SamplingParams

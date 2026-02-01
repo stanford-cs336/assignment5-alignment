@@ -45,3 +45,26 @@ uv sync --no-install-package flash-attn && uv sync  # Setup
 uv run pytest                                        # Run tests
 uv run python cs336_alignment/impl/sft_train.py     # Run SFT training
 ```
+
+## Dependency Management
+
+When fixing environment or dependency issues, **always update `pyproject.toml`** rather than using one-time `uv pip install` commands. This ensures changes are preserved for future deployments.
+
+### Guidelines
+
+1. **Version constraints**: Add minimum version constraints when a specific version is required for compatibility
+   ```toml
+   "datasets>=3.0.0",      # Required for huggingface_hub compatibility
+   "fsspec>=2024.2.0",     # Fixes glob pattern bug
+   ```
+
+2. **After updating pyproject.toml**, run:
+   ```bash
+   uv sync
+   ```
+
+3. **Common compatibility issues encountered**:
+   - `fsspec` + `huggingface_hub` + `datasets`: Ensure all three are recent versions. Old `datasets` (2.x) doesn't work with new `fsspec`/`huggingface_hub`
+   - FlashInfer vs Flash Attention: Set `VLLM_ATTENTION_BACKEND` appropriately. Use `FLASH_ATTN` if FlashInfer isn't installed
+   - Blackwell GPUs (sm_120): Require PyTorch nightly or future stable releases; current stable PyTorch only supports up to sm_90
+

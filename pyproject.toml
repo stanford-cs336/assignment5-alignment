@@ -7,8 +7,9 @@ requires-python = ">=3.11,<3.13"  # Python 3.13 not yet supported for some deps
 dependencies = [
     "accelerate>=1.5.2",
     "alpaca-eval",
-    "datasets>=2.0.0",
+    "datasets>=3.0.0",
     "flash-attn==2.7.4.post1",
+    "fsspec>=2024.2.0",
     "jupyter>=1.1.1",
     "math-verify[antlr4-13-2]>=0.7.0",
     "pylatexenc==2.10",

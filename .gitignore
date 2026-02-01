@@ -171,3 +171,4 @@ evaluation_results.jsonl
 
 # uv specific files
 uv.lock
+.idea/
