@@ -58,7 +58,7 @@ def evaluate_vllm(
     avg_format_reward = total_format_reward / len(prompts)
 
     # Serialize to disk as JSONL (one JSON object per line)
-    output_path = Path(f"evaluation_results_step_{step_number}.jsonl")
+    output_path = Path(f"rl_evaluation_results_step_{step_number}.jsonl")
     with output_path.open('w') as f:
         for result in results:
             f.write(json.dumps(result) + '\n')

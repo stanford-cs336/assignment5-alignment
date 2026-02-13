@@ -78,9 +78,122 @@ def expert_iteration():
     prompts_valid = [example['question'] for example in ds['test']]
     ground_truths_valid = [example['answer'] for example in ds['test']]
 
+    current_checkpoint = str(checkpoint_path)
+
+    if SINGLE_GPU:
+        # Single GPU mode: sequential loading/freeing to fit in memory
+        _run_single_gpu_mode(
+            tokenizer, formatted_prompts, raw_questions, raw_answers,
+            prompts_valid, ground_truths_valid, current_checkpoint
+        )
+    else:
+        # Dual GPU mode: training model on GPU 0, vLLM on GPU 1
+        # Both stay loaded throughout - use load_policy_into_vllm_instance to update weights
+        _run_dual_gpu_mode(
+            tokenizer, formatted_prompts, raw_questions, raw_answers,
+            prompts_valid, ground_truths_valid, current_checkpoint
+        )
+
+
+def _run_dual_gpu_mode(tokenizer, formatted_prompts, raw_questions, raw_answers,
+                       prompts_valid, ground_truths_valid, current_checkpoint):
+    """
+    Dual GPU mode: training model stays on GPU 0, vLLM stays on GPU 1.
+    No loading/freeing during the loop - just update vLLM weights in place.
+    """
+    # Load both models once at the start
+    print("\n[Init] Loading training model on GPU 0...")
+    model = AutoModelForCausalLM.from_pretrained(current_checkpoint).to(TRAIN_DEVICE)
+
+    print("[Init] Loading vLLM on GPU 1...")
+    vllm_instance = init_vllm(current_checkpoint, seed=42, device=VLLM_DEVICE, gpu_memory_utilization=VLLM_GPU_MEMORY)
+
+    # Create optimizer once to maintain momentum across EI steps
+    optimizer = AdamW(model.parameters(), lr=1e-5)
+
+    for ei_step in range(n_ei_steps):
+        print(f"\n{'='*60}")
+        print(f"Starting EI step {ei_step}")
+        print(f"{'='*60}")
+
+        # === PHASE 1: Generation with vLLM ===
+        current_batch_prompts = formatted_prompts[ei_step*batch_size:(ei_step+1)*batch_size]
+        current_batch_raw_answers = raw_answers[ei_step*batch_size:(ei_step+1)*batch_size]
+        current_batch_questions = raw_questions[ei_step*batch_size:(ei_step+1)*batch_size]
+
+        print(f"Generating {len(current_batch_prompts)} x {rollout_count} = {len(current_batch_prompts) * rollout_count} rollouts...")
+        current_batch_generations = vllm_instance.generate(current_batch_prompts, sampling_params)
+
+        # Log first 2 prompts and answers
+        for log_idx in range(min(2, len(current_batch_prompts))):
+            print(f"\n--- Sample {log_idx + 1} ---")
+            print(f"Question: {current_batch_questions[log_idx][:200]}...")
+            print(f"Ground truth answer: {current_batch_raw_answers[log_idx][:200]}...")
+
+        # Filter successful generations
+        current_batch_sft_prompts = []
+        current_batch_sft_answers = []
+        for i in range(len(current_batch_prompts)):
+            for j in range(len(current_batch_generations[i].outputs)):
+                current_generated_text = current_batch_generations[i].outputs[j].text
+                scores = r1_zero_reward_fn(current_generated_text, current_batch_raw_answers[i])
+
+                # Log generations and rewards for first 2 prompts
+                if i < 2:
+                    print(f"  Prompt {i} Gen {j}: {current_generated_text[:150]}...")
+                    print(f"    Rewards: format={scores['format_reward']}, answer={scores['answer_reward']}")
+
+                if scores["answer_reward"] > 0 and scores["format_reward"] > 0:
+                    current_batch_sft_prompts.append(current_batch_prompts[i])
+                    current_batch_sft_answers.append(current_generated_text)
+
+        print(f"\n{'='*60}\n")
+        print(f"EI step {ei_step}: {len(current_batch_sft_prompts)} successful generations out of {len(current_batch_prompts) * rollout_count} total")
+        wandb.log({"ei/successful_generations": len(current_batch_sft_prompts), "ei_step": ei_step})
+
+        # === PHASE 2: Training ===
+        if len(current_batch_sft_prompts) > 0:
+            print(f"\n[EI Step {ei_step}] Training on GPU 0...")
+
+            # Train (pass None for vllm_instance since we're not doing eval during training)
+            model, _, optimizer = train(
+                model, None, current_batch_sft_prompts, current_batch_sft_answers,
+                optimizer=optimizer,
+                checkpoint_prefix=f"ei_step_{ei_step}",
+                epoch_count=1,
+                init_wandb=False,
+                run_eval=False
+            )
+
+            # Update vLLM weights from training model (fast, no reload needed)
+            print(f"[EI Step {ei_step}] Updating vLLM weights in place...")
+            load_policy_into_vllm_instance(model, vllm_instance)
+        else:
+            print(f"EI step {ei_step}: No successful generations, skipping training")
+
+        # === PHASE 3: Evaluation ===
+        print(f"\n[EI Step {ei_step}] Running evaluation...")
+        run_async_evaluation(vllm_instance, r1_zero_reward_fn, prompts_valid, ground_truths_valid, eval_sampling_params, ei_step)
+
+    # Save final model
+    checkpoint_dir = Path("checkpoints")
+    checkpoint_dir.mkdir(exist_ok=True)
+    model.save_pretrained(checkpoint_dir / "ei_final")
+    tokenizer.save_pretrained(checkpoint_dir / "ei_final")
+    print(f"\nExpert iteration complete! Final model saved to {checkpoint_dir / 'ei_final'}")
+
+    wandb.finish()
+    return model, tokenizer
+
+
+def _run_single_gpu_mode(tokenizer, formatted_prompts, raw_questions, raw_answers,
+                         prompts_valid, ground_truths_valid, current_checkpoint):
+    """
+    Single GPU mode: sequential loading/freeing to fit in memory.
+    Only one model (vLLM or training) loaded at a time.
+    """
     # Track optimizer state on CPU to persist across model reloads
     optimizer_state = None
-    current_checkpoint = str(checkpoint_path)
 
     for ei_step in range(n_ei_steps):
         print(f"\n{'='*60}")
@@ -125,10 +238,9 @@ def expert_iteration():
         print(f"EI step {ei_step}: {len(current_batch_sft_prompts)} successful generations out of {len(current_batch_prompts) * rollout_count} total")
         wandb.log({"ei/successful_generations": len(current_batch_sft_prompts), "ei_step": ei_step})
 
-        # Free vLLM before training (in single GPU mode)
-        if SINGLE_GPU:
-            free_vllm(vllm_instance)
-            vllm_instance = None
+        # Free vLLM before training
+        free_vllm(vllm_instance)
+        vllm_instance = None
 
         # === PHASE 2: Training ===
         if len(current_batch_sft_prompts) > 0:
@@ -158,10 +270,9 @@ def expert_iteration():
             optimizer_state = {k: v.cpu() if isinstance(v, torch.Tensor) else v
                              for k, v in optimizer.state_dict().items()}
 
-            # Free training model before evaluation (in single GPU mode)
-            if SINGLE_GPU:
-                free_model(model)
-                model = None
+            # Free training model before evaluation
+            free_model(model)
+            model = None
         else:
             print(f"EI step {ei_step}: No successful generations, skipping training")
 
@@ -169,15 +280,11 @@ def expert_iteration():
         print(f"\n[EI Step {ei_step}] Loading vLLM for evaluation...")
         vllm_instance = init_vllm(current_checkpoint, seed=42, device=VLLM_DEVICE, gpu_memory_utilization=VLLM_GPU_MEMORY)
 
-        # Run evaluation synchronously in single GPU mode, async otherwise
-        if SINGLE_GPU:
-            run_async_evaluation(vllm_instance, r1_zero_reward_fn, prompts_valid, ground_truths_valid, eval_sampling_params, ei_step)
-            free_vllm(vllm_instance)
-            vllm_instance = None
-        else:
-            # In dual GPU mode, keep vLLM loaded for next iteration
-            load_policy_into_vllm_instance(model, vllm_instance)
-            run_async_evaluation(vllm_instance, r1_zero_reward_fn, prompts_valid, ground_truths_valid, eval_sampling_params, ei_step)
+        run_async_evaluation(vllm_instance, r1_zero_reward_fn, prompts_valid, ground_truths_valid, eval_sampling_params, ei_step)
+
+        # Free vLLM after evaluation
+        free_vllm(vllm_instance)
+        vllm_instance = None
 
     # Save final model
     print(f"\n[Final] Loading model to save final checkpoint...")
